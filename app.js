@@ -67,7 +67,7 @@ const getStore = async () => {
     for (const url of capterUrls) {
       try {
         const detail = await getCapterDetail(url);
-        console.log(detail);
+        console.log(`Processed chapter ${url}`)
         details.push(detail);
       } catch (error) {
         console.error(`Error processing chapter ${url}:`, error);
