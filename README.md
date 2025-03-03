@@ -1,2 +1,2 @@
-# sfacgSaveForMarkdown
-保存菠萝包轻小说整本小说为markodown
+# crawl_fiction
+用来爬取最近30天更新的小说, 并自动调用收录接口, 用于维护数据网同步状态
