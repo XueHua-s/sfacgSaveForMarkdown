@@ -2,7 +2,7 @@ const cheerio = require('cheerio');
 const request = require('./request');
 const axios = require("axios");
 const fs = require('fs');
-
+const {bookUid} = require("./config")
 const getChapters = async (bookPageUrl) => {
   try {
     const { data } = await request.get(bookPageUrl);
@@ -56,7 +56,7 @@ const getCapterDetail = async (url) => {
 const getStore = async () => {
   try {
     // 获取章节 URL 数组
-    const capterUrls = await getChapters("/Novel/41103/MainIndex/");
+    const capterUrls = await getChapters(`/Novel/${bookUid}/MainIndex/`);
     if (capterUrls.length === 0) {
       console.error("No chapters found or failed to retrieve chapters.");
       return;
