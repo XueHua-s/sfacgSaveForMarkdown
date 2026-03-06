@@ -1,237 +1,239 @@
-const cheerio = require('cheerio');
-const request = require('./request');
-const axios = require("axios");
 const fs = require('fs');
-const {bookUid, saveMode, concurrentThreads} = require("./config")
-const path = require('path');
-const { Worker } = require('worker_threads');
 const os = require('os');
+const path = require('path');
+const puppeteer = require('puppeteer');
+const { baseUrl, bookUid, saveMode, concurrentThreads } = require('./config');
 
-// 清理文件名，移除不合法字符
 const sanitizeFileName = (fileName) => {
   return fileName.replace(/[<>:"/\\|?*]/g, '_').trim();
 };
 
-// 并发处理章节
-const processChaptersConcurrently = async (chapters, saveMode) => {
-  const maxWorkers = Math.min(concurrentThreads || 3, os.cpus().length, chapters.length);
-  const results = [];
-  const errors = [];
-  
-  // 创建任务队列
-  const taskQueue = [...chapters];
-  const workers = [];
-  const activeWorkers = new Set();
-  
-  return new Promise((resolve, reject) => {
-    let completedTasks = 0;
-    
-    const createWorker = () => {
-      if (taskQueue.length === 0) return null;
-      
-      const chapter = taskQueue.shift();
-      let volumeDir = null;
-      if (saveMode === 2) {
-        const sanitizedBookTitle = sanitizeFileName(chapter.bookTitle);
-        const sanitizedVolumeTitle = sanitizeFileName(chapter.volume);
-        volumeDir = path.join('.', sanitizedBookTitle, sanitizedVolumeTitle);
-      }
-      
-      const worker = new Worker('./worker.js', {
-        workerData: {
-          chapter,
-          saveMode,
-          volumeDir
-        }
-      });
-      
-      activeWorkers.add(worker);
-      
-      worker.on('message', (result) => {
-        completedTasks++;
-        
-        if (result.success) {
-          if (saveMode === 1) {
-            results.push({ chapter: result.chapter, detail: result.detail });
-          }
-          console.log(result.message || `Processed chapter: ${result.chapter.title}`);
-        } else {
-          errors.push({ chapter: result.chapter, error: result.error });
-          console.error(`Error processing chapter ${result.chapter.title}:`, result.error);
-        }
-        
-        // 清理worker
-        activeWorkers.delete(worker);
-        worker.terminate();
-        
-        // 检查是否还有任务
-        if (taskQueue.length > 0) {
-          const newWorker = createWorker();
-          if (newWorker) workers.push(newWorker);
-        }
-        
-        // 检查是否所有任务完成
-        if (completedTasks === chapters.length) {
-          resolve({ results, errors });
-        }
-      });
-      
-      worker.on('error', (error) => {
-        completedTasks++;
-        errors.push({ chapter, error: error.message });
-        console.error(`Worker error for chapter ${chapter.title}:`, error);
-        
-        activeWorkers.delete(worker);
-        
-        if (taskQueue.length > 0) {
-          const newWorker = createWorker();
-          if (newWorker) workers.push(newWorker);
-        }
-        
-        if (completedTasks === chapters.length) {
-          resolve({ results, errors });
-        }
-      });
-      
-      return worker;
-    };
-    
-    // 启动初始workers
-    for (let i = 0; i < maxWorkers; i++) {
-      const worker = createWorker();
-      if (worker) workers.push(worker);
-    }
-    
-    // 如果没有章节需要处理
-    if (chapters.length === 0) {
-      resolve({ results: [], errors: [] });
-    }
-  });
+const getChromeExecutablePath = () => {
+  const candidates = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser'
+  ].filter(Boolean);
+
+  return candidates.find((candidate) => fs.existsSync(candidate));
 };
-const getChapters = async (bookPageUrl) => {
-  try {
-    const { data } = await request.get(bookPageUrl);
-    const $ = cheerio.load(data);
+
+const launchBrowser = async () => {
+  const executablePath = getChromeExecutablePath();
+  const launchOptions = {
+    headless: 'new'
+  };
+
+  if (executablePath) {
+    launchOptions.executablePath = executablePath;
+  }
+
+  return puppeteer.launch(launchOptions);
+};
+
+const getChapters = async (page, bookPageUrl) => {
+  const targetUrl = new URL(bookPageUrl, baseUrl).toString();
+
+  await page.goto(targetUrl, {
+    waitUntil: 'networkidle2',
+    timeout: 60000
+  });
+
+  await page.waitForSelector('.story-title', {
+    timeout: 15000
+  });
+
+  return page.evaluate(() => {
     const chapters = [];
-    
-    // 获取书名
-    const bookTitle = $('.story-title').text().trim() || '未知书名';
-    
-    // 获取卷信息和章节信息 - 适配新的网站结构
-    $('.story-catalog').each((volumeIndex, volumeElement) => {
-      const volumeTitle = $(volumeElement).find('.catalog-title').text().trim() || `卷${volumeIndex + 1}`;
-      
-      $(volumeElement).find('.catalog-list .clearfix > li > a').each((index, element) => {
-        const href = $(element).attr('href');
-        const chapterTitle = $(element).text().trim();
+    const bookTitle = document.querySelector('.story-title')?.textContent?.trim() || '未知书名';
+
+    document.querySelectorAll('.story-catalog').forEach((volumeElement, volumeIndex) => {
+      const volumeTitle = volumeElement.querySelector('.catalog-title')?.textContent?.trim() || `卷${volumeIndex + 1}`;
+
+      volumeElement.querySelectorAll('.catalog-list .clearfix > li > a').forEach((anchor) => {
+        const href = anchor.getAttribute('href');
+        const chapterTitle = anchor.textContent.trim();
+
         if (href && !href.startsWith('/vip')) {
           chapters.push({
-            url: href,
+            url: anchor.href,
             title: chapterTitle,
             volume: volumeTitle,
-            bookTitle: bookTitle
+            bookTitle
           });
         }
       });
     });
-    
-    // 如果没有找到卷结构，使用备用逻辑
+
     if (chapters.length === 0) {
-      $('.clearfix > li > a').each((index, element) => {
-        const href = $(element).attr('href');
-        const chapterTitle = $(element).text().trim();
+      document.querySelectorAll('.clearfix > li > a').forEach((anchor) => {
+        const href = anchor.getAttribute('href');
+        const chapterTitle = anchor.textContent.trim();
+
         if (href && !href.startsWith('/vip')) {
           chapters.push({
-            url: href,
+            url: anchor.href,
             title: chapterTitle,
             volume: '默认卷',
-            bookTitle: bookTitle
+            bookTitle
           });
         }
       });
     }
-    
+
     return chapters;
-  } catch (error) {
-    console.error(`Error fetching chapters from ${bookPageUrl}:`, error);
-    // 返回空数组，保证后续代码能够正常处理
-    return [];
-  }
+  });
 };
 
+const getChapterDetail = async (page, url) => {
+  await page.goto(url, {
+    waitUntil: 'networkidle2',
+    timeout: 60000
+  });
 
+  await page.waitForSelector('.article-hd .article-title, .article-content', {
+    timeout: 15000
+  });
+
+  return page.evaluate(() => {
+    const desc = [...document.querySelectorAll('.article-hd .article-desc .text')].map((element) => element.textContent.trim());
+    const paragraphs = [...document.querySelectorAll('.article-content p')]
+      .map((element) => element.textContent.trim())
+      .filter(Boolean);
+
+    return {
+      title: document.querySelector('.article-hd .article-title')?.textContent?.trim() || '未知章节',
+      author: desc[0] || '',
+      updateTime: desc[1] || '',
+      wordCount: desc[2] || '',
+      content: `${paragraphs.join('\n\n')}\n\n`
+    };
+  });
+};
+
+const saveChapterToFile = (chapter, detail) => {
+  const bookDir = sanitizeFileName(chapter.bookTitle);
+  const volumeDir = sanitizeFileName(chapter.volume);
+  const chapterName = sanitizeFileName(chapter.title);
+  const targetDir = path.join('.', bookDir, volumeDir);
+  const targetFile = path.join(targetDir, `${chapterName}.md`);
+  const content = `# ${detail.title}\n\n${detail.author} | ${detail.updateTime} | ${detail.wordCount}\n\n${detail.content}`;
+
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.writeFileSync(targetFile, content, 'utf8');
+
+  return targetFile;
+};
+
+const processChaptersConcurrently = async (browser, chapters, currentSaveMode) => {
+  const maxWorkers = Math.min(concurrentThreads || 3, os.cpus().length, chapters.length);
+  const results = [];
+  const errors = [];
+  let currentIndex = 0;
+
+  const worker = async () => {
+    const page = await browser.newPage();
+
+    try {
+      while (currentIndex < chapters.length) {
+        const chapterIndex = currentIndex++;
+        const chapter = chapters[chapterIndex];
+
+        try {
+          const detail = await getChapterDetail(page, chapter.url);
+
+          if (currentSaveMode === 2) {
+            const filePath = saveChapterToFile(chapter, detail);
+            console.log(`Processed chapter: ${filePath}`);
+          } else {
+            results.push({ index: chapterIndex, chapter, detail });
+            console.log(`Processed chapter: ${chapter.title}`);
+          }
+        } catch (error) {
+          errors.push({ chapter, error: error.message });
+          console.error(`Error processing chapter ${chapter.title}: ${error.message}`);
+        }
+      }
+    } finally {
+      await page.close();
+    }
+  };
+
+  await Promise.all(Array.from({ length: maxWorkers }, () => worker()));
+
+  return { results, errors };
+};
+
+const writeMergedMarkdown = (results) => {
+  const sortedResults = results.sort((a, b) => a.index - b.index);
+  let outputContent = '';
+  let currentBookTitle = '';
+  let currentVolume = '';
+
+  for (const result of sortedResults) {
+    const { detail, chapter } = result;
+
+    if (currentBookTitle !== chapter.bookTitle) {
+      currentBookTitle = chapter.bookTitle;
+      outputContent += `# ${currentBookTitle}\n\n`;
+    }
+
+    if (currentVolume !== chapter.volume) {
+      currentVolume = chapter.volume;
+      outputContent += `## ${currentVolume}\n\n`;
+    }
+
+    outputContent += `### ${detail.title}\n\n${detail.author} | ${detail.updateTime} | ${detail.wordCount}\n\n${detail.content}`;
+  }
+
+  fs.writeFileSync('output.md', outputContent, 'utf8');
+  console.log('文件保存成功：output.md');
+};
 
 const getStore = async () => {
+  let browser;
+
   try {
-    // 获取章节信息数组
-    const chapters = await getChapters(`/Novel/${bookUid}/MainIndex/`);
+    browser = await launchBrowser();
+    const page = await browser.newPage();
+    const chapters = await getChapters(page, `/Novel/${bookUid}/MainIndex/`);
+    await page.close();
+
     if (chapters.length === 0) {
-      console.error("No chapters found or failed to retrieve chapters.");
+      console.error('No chapters found or failed to retrieve chapters.');
       return;
     }
 
-    console.log(`开始处理 ${chapters.length} 个章节，使用 ${Math.min(concurrentThreads || 3, os.cpus().length, chapters.length)} 个并发线程`);
-    
+    const workerCount = Math.min(concurrentThreads || 3, os.cpus().length, chapters.length);
+    console.log(`开始处理 ${chapters.length} 个章节，使用 ${workerCount} 个并发页面`);
+
     const startTime = Date.now();
-    const { results, errors } = await processChaptersConcurrently(chapters, saveMode);
+    const { results, errors } = await processChaptersConcurrently(browser, chapters, saveMode);
     const endTime = Date.now();
-    
+
     console.log(`处理完成，耗时: ${(endTime - startTime) / 1000}秒`);
     console.log(`成功: ${chapters.length - errors.length}, 失败: ${errors.length}`);
-    
+
     if (saveMode === 1) {
-      // 原有保存方式：单个md文件，按正确的层级结构组织
-      // 按章节顺序排序结果
-      const sortedResults = results.sort((a, b) => {
-        const aIndex = chapters.findIndex(ch => ch.url === a.chapter.url);
-        const bIndex = chapters.findIndex(ch => ch.url === b.chapter.url);
-        return aIndex - bIndex;
-      });
-      
-      // 构建正确的Markdown层级结构
-      let outputContent = '';
-      let currentBookTitle = '';
-      let currentVolume = '';
-      
-      for (const result of sortedResults) {
-        const { detail, chapter } = result;
-        
-        // 添加书名（一级标题）
-        if (currentBookTitle !== chapter.bookTitle) {
-          currentBookTitle = chapter.bookTitle;
-          outputContent += `# ${currentBookTitle}\n\n`;
-        }
-        
-        // 添加卷名（二级标题）
-        if (currentVolume !== chapter.volume) {
-          currentVolume = chapter.volume;
-          outputContent += `## ${currentVolume}\n\n`;
-        }
-        
-        // 添加章节（三级标题）和内容
-        outputContent += `### ${detail.title}\n\n${detail.author} | ${detail.updateTime} | ${detail.wordCount}\n\n${detail.content}\n`;
-      }
-      
-      try {
-        fs.writeFileSync('output.md', outputContent, 'utf8');
-        console.log('文件保存成功：output.md');
-      } catch (error) {
-        console.error('Error writing to file:', error);
-      }
+      writeMergedMarkdown(results);
     } else if (saveMode === 2) {
-      // 新保存方式：按书名/卷名创建文件夹，章节名为md名称
       console.log('所有章节保存完成，按书名/卷名分文件夹保存');
     }
-    
-    // 输出错误信息
+
     if (errors.length > 0) {
       console.log('\n处理失败的章节:');
-      errors.forEach(error => {
+      errors.forEach((error) => {
         console.log(`- ${error.chapter.title}: ${error.error}`);
       });
     }
   } catch (error) {
-    console.error('Error in getStore:', error);
+    console.error('Error in getStore:', error.message);
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 };
 
